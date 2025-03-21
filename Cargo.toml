@@ -13,6 +13,8 @@ futures = "0.3"
 openssl = { version = "0.10", features = ["vendored"] }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
 rand = "0.8.5"
-reqwest = { version = "0.12", features = ["stream"] }
-tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "fs"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "fs", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }

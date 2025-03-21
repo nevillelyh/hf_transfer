@@ -5,11 +5,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use rand::{thread_rng, Rng};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ToStrError, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE,
+    HeaderMap, HeaderName, HeaderValue, ToStrError, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, USER_AGENT,
     RANGE,
 };
 use reqwest::Url;
+use serde_json::json;
 use std::collections::HashMap;
+use std::env;
 use std::fmt::Display;
 use std::fs::remove_file;
 use std::io::SeekFrom;
@@ -19,12 +21,16 @@ use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 const BASE_WAIT_TIME: usize = 300;
 const MAX_WAIT_TIME: usize = 10_000;
+
+const PGET_HF_TRANSFER: &str = "PGET_HF_TRANSFER";
+const PGET_METRICS_ENDPOINT: &str = "PGET_METRICS_ENDPOINT";
 
 /// max_files: Number of open file handles, which determines the maximum number of parallel downloads
 /// parallel_failures:  Number of maximum failures of different chunks in parallel (cannot exceed max_files)
@@ -147,6 +153,68 @@ pub fn exponential_backoff(base_wait_time: usize, n: usize, max: usize) -> usize
     (base_wait_time + n.pow(2) + jitter()).min(max)
 }
 
+async fn send_pget_metric_async(url: String, size: usize) -> std::io::Result<()> {
+    if let Ok(endpoint) = env::var(PGET_METRICS_ENDPOINT) {
+        let body = json!({
+            "source": "hf_transfer",
+            "type": "download",
+            "data": {
+                "url": url,
+                "size": size,
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        });
+        let client = reqwest::Client::new();
+        client.post(endpoint).json(&body).send().await
+            .map(|_| ())
+            .or(Err(std::io::Error::other("failed to send metrics")))
+    } else {
+        Ok(())
+    }
+}
+
+async fn try_pget_async(
+    url: String,
+    filename: String,
+    max_files: usize,
+    chunk_size: usize,
+    max_retries: usize,
+    input_headers: &Option<HashMap<String, String>>,
+) -> std::io::Result<()> {
+    if env::var(PGET_HF_TRANSFER).is_err() {
+        return Err(std::io::Error::other("PGET_HF_TRANSFER not set"))
+    }
+
+    // Fallback for any header we don't recognize
+    if let Some(headers) = &input_headers {
+        for k in headers.keys() {
+            if !k.eq_ignore_ascii_case(&USER_AGENT.as_str()) {
+                return Err(std::io::Error::other("invalid header"))
+            }
+        }
+    }
+
+    let mut cmd = Command::new("pget");
+    let cmd = if filename.ends_with(".incomplete") { cmd.arg("--force") } else { &mut cmd };
+
+    let args: &[String] = &[
+        "--concurrency".into(), max_files.to_string(),
+        "--chunk-size".into(), chunk_size.to_string(),
+        "--retries".into(), max_retries.to_string(),
+        url,
+        filename,
+    ];
+    match cmd.args(args).status().await {
+        Ok(status) =>
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("failed to run pget command"))
+            }
+        Err(e) => Err(e)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_async(
     url: String,
@@ -158,6 +226,10 @@ async fn download_async(
     input_headers: Option<HashMap<String, String>>,
     callback: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
+    if try_pget_async(url.clone(), filename.clone(), max_files, chunk_size, max_retries, &input_headers).await.is_ok() {
+        return Ok(());
+    }
+
     let client = reqwest::Client::builder()
         // https://github.com/hyperium/hyper/issues/2136#issuecomment-589488526
         .http2_keep_alive_timeout(Duration::from_secs(15))
@@ -227,6 +299,10 @@ async fn download_async(
         .parse()
         .map_err(|err| PyException::new_err(format!("Error while downloading: {err}")))?;
 
+    // Metrics are sent by pget instead if PGET_HF_TRANSFER is set and this function is bypassed
+    // Otherwise send here after length is known
+    let metrics = tokio::spawn(send_pget_metric_async(url, length));
+
     let mut handles = FuturesUnordered::new();
     let semaphore = Arc::new(Semaphore::new(max_files));
     let parallel_failures_semaphore = Arc::new(Semaphore::new(parallel_failures));
@@ -272,6 +348,8 @@ async fn download_async(
             chunk.map_err(|e| PyException::new_err(format!("Downloading error {e}"))).and(Ok(stop - start))
         }));
     }
+
+    _ = metrics.await;
 
     // Output the chained result
     while let Some(result) = handles.next().await {
