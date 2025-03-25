@@ -8,4 +8,4 @@ maturin build --release --out dist
 maturin build --release --out dist -i python3.13t
 EOF
 
-docker run -it --rm -v $PWD:/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c "$SCRIPT"
+docker run -t --rm -v $PWD:/io --entrypoint /bin/bash ghcr.io/pyo3/maturin -c "$SCRIPT"
