@@ -9,7 +9,7 @@ use reqwest::header::{
     RANGE,
 };
 use reqwest::Url;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Display;
@@ -18,6 +18,7 @@ use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -153,16 +154,23 @@ pub fn exponential_backoff(base_wait_time: usize, n: usize, max: usize) -> usize
     (base_wait_time + n.pow(2) + jitter()).min(max)
 }
 
-async fn send_pget_metric_async(url: String, size: usize) -> std::io::Result<()> {
+async fn send_pget_metric_async(url: String, size: usize, duration: Duration, error: Option<String>) -> std::io::Result<()> {
     if let Ok(endpoint) = env::var(PGET_METRICS_ENDPOINT) {
+        let mut data: HashMap<&str, Value> = HashMap::from([
+            ("url", Value::from(url)),
+            ("size", Value::from(size)),
+            ("version", Value::from(env!("CARGO_PKG_VERSION"))),
+        ]);
+        if let Some(e) = error {
+            data.insert("error", e.into());
+        } else {
+            let bps = size as f64 / duration.as_secs_f64();
+            data.insert("bytes_per_second", bps.into());
+        }
         let body = json!({
             "source": "hf_transfer",
             "type": "download",
-            "data": {
-                "url": url,
-                "size": size,
-                "version": env!("CARGO_PKG_VERSION"),
-            }
+            "data": data,
         });
         let client = reqwest::Client::new();
         client.post(endpoint).json(&body).send().await
@@ -299,9 +307,7 @@ async fn download_async(
         .parse()
         .map_err(|err| PyException::new_err(format!("Error while downloading: {err}")))?;
 
-    // Metrics are sent by pget instead if PGET_HF_TRANSFER is set and this function is bypassed
-    // Otherwise send here after length is known
-    let metrics = tokio::spawn(send_pget_metric_async(url, length));
+    let start_time = Instant::now();
 
     let mut handles = FuturesUnordered::new();
     let semaphore = Arc::new(Semaphore::new(max_files));
@@ -349,8 +355,6 @@ async fn download_async(
         }));
     }
 
-    _ = metrics.await;
-
     // Output the chained result
     while let Some(result) = handles.next().await {
         match result {
@@ -360,15 +364,22 @@ async fn download_async(
                 }
             }
             Ok(Err(py_err)) => {
+                let _= tokio::spawn(send_pget_metric_async(url.clone(), length, Duration::from_secs(0), Some(py_err.to_string()))).await;
                 return Err(py_err);
             }
             Err(err) => {
+                let _= tokio::spawn(send_pget_metric_async(url.clone(), length, Duration::from_secs(0), Some(err.to_string()))).await;
                 return Err(PyException::new_err(format!(
                     "Error while downloading: {err}"
                 )));
             }
         }
     }
+
+    // Metrics are sent by pget instead if PGET_HF_TRANSFER is set and this function is bypassed
+    // Otherwise send here after length & duration are known
+    let elapsed = Instant::now() - start_time;
+    let _= tokio::spawn(send_pget_metric_async(url.clone(), length, elapsed, None)).await;
     Ok(())
 }
 
